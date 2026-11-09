@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PageForge 控制台</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">PF</span>
+      <div>
+        <h1>PageForge</h1>
+        <p>静态站点托管控制台</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="conn-dot" class="dot offline"></span>
+      <span id="conn-text">未连接</span>
+      <button id="btn-settings" class="btn ghost">连接设置</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="overview">总览</button>
+    <button class="tab" data-view="aliases">对象存储</button>
+    <button class="tab" data-view="projects">项目管理</button>
+    <button class="tab" data-view="bindings">访问绑定</button>
+    <button class="tab" data-view="auth">访问鉴权</button>
+    <button class="tab" data-view="shares">分享链接</button>
+    <button class="tab" data-view="deployments">发布记录</button>
+    <button class="tab" data-view="monitoring">日志与指标</button>
+  </nav>
+
+  <main>
+    <section class="view active" id="view-overview">
+      <div class="toolbar">
+        <h2>总览</h2>
+        <button class="btn" id="btn-refresh-overview">刷新</button>
+      </div>
+      <div class="cards four">
+        <div class="card stat"><span>对象存储</span><strong id="stat-aliases">—</strong></div>
+        <div class="card stat"><span>项目管理</span><strong id="stat-projects">—</strong></div>
+        <div class="card stat"><span>启用绑定</span><strong id="stat-bindings">—</strong></div>
+        <div class="card stat"><span>请求总数</span><strong id="stat-requests">—</strong></div>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <h3>快速开始</h3>
+          <ol class="steps">
+            <li>在「对象存储别名」中配置 S3 / MinIO 凭证并测试连通性。</li>
+            <li>在「项目」中创建站点，绑定别名与 bucket。</li>
+            <li>在「访问绑定」中把域名与路径前缀指向项目；需要保护的 URL 可在「访问鉴权」中配置 Basic Auth。</li>
+            <li>在项目详情中上传发布包（.zip / .tar / .tar.gz）完成首次发布。</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h3>控制面状态</h3>
+          <div class="kv"><span>管理 API</span><code id="info-api">—</code></div>
+          <div class="kv"><span>健康检查</span><code id="info-health">—</code></div>
+          <div class="kv"><span>页面加载</span><code id="info-loaded">—</code></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-aliases">
+      <div class="toolbar">
+        <h2>对象存储别名</h2>
+        <button class="btn" id="btn-new-alias">新建别名</button>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-aliases" class="search-input" placeholder="搜索名称、Endpoint、Region、Bucket">
+          </div>
+          <select class="page-size" id="ps-aliases">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:15%">名称</th><th style="width:23%">Endpoint</th><th style="width:9%">Region</th><th>Bucket 白名单</th><th style="width:8%">密钥</th><th class="right" style="width:18%">操作</th></tr></thead>
+          <tbody id="tbody-aliases"></tbody>
+        </table>
+        <div class="empty" id="empty-aliases">暂无别名</div>
+        <div class="pagination hidden" id="pager-aliases"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-projects">
+      <div class="toolbar">
+        <h2>项目</h2>
+        <button class="btn" id="btn-new-project">新建项目</button>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-projects" class="search-input" placeholder="搜索名称、描述、别名、Bucket">
+          </div>
+          <select class="page-size" id="ps-projects">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:16%">名称</th><th style="width:10%">存储</th><th style="width:15%">Bucket</th><th style="width:13%">当前版本</th><th>特性</th><th class="right" style="width:18%">操作</th></tr></thead>
+          <tbody id="tbody-projects"></tbody>
+        </table>
+        <div class="empty" id="empty-projects">暂无项目</div>
+        <div class="pagination hidden" id="pager-projects"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-project-detail">
+      <div class="toolbar">
+        <h2>项目详情 <span id="detail-project-name" class="hint"></span></h2>
+        <button class="btn ghost" id="btn-detail-back">← 返回项目列表</button>
+      </div>
+      <div id="detail-body"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="view" id="view-bindings">
+      <div class="toolbar">
+        <h2>访问绑定</h2>
+        <button class="btn" id="btn-new-binding">新建绑定</button>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-bindings" class="search-input" placeholder="搜索 Host、路径前缀、项目、鉴权策略">
+          </div>
+          <select class="page-size" id="ps-bindings">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:16%">Host</th><th>路径前缀</th><th style="width:12%">项目</th><th style="width:14%">鉴权</th><th style="width:12%">固定版本</th><th style="width:9%">状态</th><th class="right" style="width:14%">操作</th></tr></thead>
+          <tbody id="tbody-bindings"></tbody>
+        </table>
+        <div class="empty" id="empty-bindings">暂无绑定</div>
+        <div class="pagination hidden" id="pager-bindings"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-auth">
+      <div class="toolbar">
+        <h2>访问鉴权</h2>
+        <div class="toolbar-actions">
+          <span class="hint">Basic Auth 策略可被一个或多个 URL 绑定复用；绑定未选择策略时为公开访问</span>
+          <button class="btn" id="btn-new-auth">新建鉴权策略</button>
+        </div>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-auth" class="search-input" placeholder="搜索策略名称">
+          </div>
+          <select class="page-size" id="ps-auth">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:18%">名称（Realm）</th><th style="width:10%">模式</th><th style="width:8%">用户数</th><th style="width:10%">Secret 版本</th><th style="width:19%">更新时间</th><th class="right" style="width:18%">操作</th></tr></thead>
+          <tbody id="tbody-auth"></tbody>
+        </table>
+        <div class="empty" id="empty-auth">暂无鉴权策略</div>
+        <div class="pagination hidden" id="pager-auth"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-shares">
+      <div class="toolbar">
+        <h2>分享链接</h2>
+        <div class="toolbar-actions">
+          <span class="hint">链接路径形如 /__pageforge/s/&lt;token&gt;/，可拼接到站点域名后使用</span>
+          <button class="btn" id="btn-new-share">新建分享链接</button>
+        </div>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-shares" class="search-input" placeholder="搜索项目、Token、状态">
+          </div>
+          <select class="page-size" id="ps-shares">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:12%">项目</th><th style="width:12%">版本</th><th style="width:14%">Token</th><th style="width:7%">密码</th><th style="width:15%">到期</th><th style="width:8%">访问</th><th style="width:9%">状态</th><th class="right" style="width:18%">操作</th></tr></thead>
+          <tbody id="tbody-shares"></tbody>
+        </table>
+        <div class="empty" id="empty-shares">暂无分享链接</div>
+        <div class="pagination hidden" id="pager-shares"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-deployments">
+      <div class="toolbar">
+        <h2>发布记录</h2>
+        <div class="toolbar-actions">
+          <span class="hint">记录来自控制面数据库</span>
+          <button class="btn" id="btn-refresh-deployments">刷新</button>
+        </div>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-deployments" class="search-input" placeholder="搜索项目、Deployment ID、状态">
+          </div>
+          <select class="page-size" id="ps-deployments">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:15%">时间</th><th>项目</th><th style="width:14%">Deployment</th><th style="width:9%">状态</th><th style="width:13%">版本</th><th style="width:8%">文件数</th><th class="right" style="width:12%">操作</th></tr></thead>
+          <tbody id="tbody-deployments"></tbody>
+        </table>
+        <div class="empty" id="empty-deployments">还没有发布记录，请到项目详情中上传发布包</div>
+        <div class="pagination hidden" id="pager-deployments"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-monitoring">
+      <div class="toolbar">
+        <h2>日志与指标</h2>
+        <div class="toolbar-actions">
+          <span class="hint">最近 200 条控制面请求</span>
+          <button class="btn" id="btn-refresh-monitoring">刷新</button>
+        </div>
+      </div>
+      <div class="cards four">
+        <div class="card stat"><span>运行时长</span><strong id="m-uptime">—</strong></div>
+        <div class="card stat"><span>请求总数</span><strong id="m-total">—</strong></div>
+        <div class="card stat"><span>4xx</span><strong id="m-4xx">—</strong></div>
+        <div class="card stat"><span>5xx</span><strong id="m-5xx">—</strong></div>
+      </div>
+      <div class="card table-wrap">
+        <div class="list-bar">
+          <div class="search-box">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <input type="search" id="search-logs" class="search-input" placeholder="搜索方法、路径、状态码、Request ID">
+          </div>
+          <select class="page-size" id="ps-logs">
+            <option value="10" selected>10 条/页</option>
+            <option value="20">20 条/页</option>
+            <option value="50">50 条/页</option>
+          </select>
+        </div>
+        <table>
+          <thead><tr><th style="width:11%">时间</th><th style="width:7%">方法</th><th>路径</th><th style="width:7%">状态</th><th style="width:9%">耗时</th><th style="width:9%">字节</th><th style="width:15%">Request ID</th></tr></thead>
+          <tbody id="tbody-logs"></tbody>
+        </table>
+        <div class="empty" id="empty-logs">暂无请求记录</div>
+        <div class="pagination hidden" id="pager-logs"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal" id="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3 id="modal-title">标题</h3>
+        <button class="icon-btn" id="modal-close" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-foot" id="modal-foot"></div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+  <script src="./app.js"></script>
+</body>
+</html>

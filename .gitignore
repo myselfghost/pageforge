@@ -1,0 +1,11 @@
+*.test
+*.out
+coverage.*
+.env
+config.local.yaml
+.DS_Store
+testdata/tmp/
+/.tmp/
+*.db
+/logs/
+bin/logs/

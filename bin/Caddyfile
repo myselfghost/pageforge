@@ -1,0 +1,72 @@
+{
+	admin off
+	# 纯 HTTP 人工测试，不启用自动 HTTPS
+	auto_https off
+
+	# 错误日志：Caddy 自身运行日志（启动、配置重载、模块告警与错误）。
+	# 目录与保留天数可用环境变量覆盖；保留天数按天为单位，例如 7d、30d、90d。
+	#
+	# 调试时如需把全部运行日志（含 s3static 模块日志）输出到控制台：
+	#   1) 取消下一行的 debug，打开 debug 级别（默认只输出 INFO 及以上）
+	#   2) 注释掉下面的 output file 块，改为 output stdout / format console
+	#debug
+	log {
+		#output stdout
+		#format console
+		output file {$PAGEFORGE_LOG_DIR:./logs}/error.log {
+			roll_keep 365
+			roll_keep_for {$PAGEFORGE_LOG_KEEP:30d}
+			roll_at 00:00
+			roll_local_time
+		}
+		format json
+	}
+}
+
+# 数据面监听端口由 site address 决定；非 root 运行时可改为 :8080 等高端口
+:80 {
+	# 访问日志：客户端请求，按天轮换，保留天数由 PAGEFORGE_LOG_KEEP 控制。
+	#
+	# 调试时如需把访问日志输出到控制台：
+	#   注释掉下面的 output file 块，改为 output stdout / format console
+	log {
+		#output stdout
+		#format console
+		output file {$PAGEFORGE_LOG_DIR:./logs}/access.log {
+			roll_keep 365
+			roll_keep_for {$PAGEFORGE_LOG_KEEP:30d}
+			roll_at 00:00
+			roll_local_time
+		}
+		format json
+	}
+
+	route {
+		s3static {
+			control_url http://127.0.0.1:8081
+			internal_token 8e0629dd617885e71690d9932a1a75b7f7e4d5eb8ba0dc23ff4489cfff0a4fdb
+			poll_interval 2s
+			# 系统保留前缀，可自定义，建议 /__pageforge
+			reserved_prefix /__pageforge
+			cache_dir ./cache
+			cache_max_bytes 10737418240
+			cache_ttl 24h
+			#cache_max_bytes 10240
+			#cache_ttl 3m
+			cache_evict_ratio 0.6
+			# 与对象存储建立连接的超时，默认 10s
+			upstream_connect_timeout 10s
+			# 等待存储返回首字节（响应头）的超时（，默认 10s
+			upstream_read_timeout 10s
+			# 回源读取 body 的空闲超时：
+			# 只要有数据流动就重置，仅当连续无数据超过该值才中断，默认 60s
+			upstream_idle_timeout 60s
+			# 单次回源的整体硬上限（0 表示不限制）
+			upstream_total_timeout 0s
+			# 与客户端之间的空闲超时：持续有数据则永不超时，默认 60s
+			client_idle_timeout 60s
+			# 与客户端之间的整体硬上限（0 表示不限制）
+			client_total_timeout 0s
+		}
+	}
+}

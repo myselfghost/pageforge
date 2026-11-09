@@ -1,0 +1,64 @@
+server:
+  # 管理 API 与 Web 控制台监听地址（0.0.0.0 便于远程访问；只开内网时改为 127.0.0.1:8080）
+  listen: "0.0.0.0:8082"
+  # 内部 API，仅数据面（Caddy 代理）访问，保持本机回环
+  internal_listen: "127.0.0.1:8081"
+  admin_token: "ea5d49f4541a43099b51fa1bab0bad8846d9aae4304c0f8dcc56023d986fbaa2"
+  internal_token: "8e0629dd617885e71690d9932a1a75b7f7e4d5eb8ba0dc23ff4489cfff0a4fdb"
+  reserved_prefix: "/__pageforge"
+  snapshot_warn_bytes: 33554432
+
+database:
+  driver: sqlite
+  # 相对当前工作目录；控制面启动时会自动建库
+  dsn: "./control.db"
+  # 多节点或已有 PostgreSQL 时改用：
+  #driver: postgres
+  #dsn: "postgres://erdp_test_pg:491_test@10.81.129.156:8432/pageforge"
+
+encryption:
+  # base64 编码的 32 字节 AES 主密钥，可用 PAGEFORGE_MASTER_KEY 覆盖
+  master_key: "ZFIFZSjwMFc0CzY75HIdHpKQ8TlYZRy+FxA652VZV+w="
+
+storage:
+  manifest_prefix: "_system/manifests"
+  package_prefix: "_system/packages"
+  staging_prefix: "_system/staging"
+
+publish:
+  max_files: 200000
+  max_file_bytes: 2147483648
+  max_total_bytes: 53687091200
+  max_package_bytes: 4294967296
+  idempotency_ttl: 24h
+  # 并发上传文件的 worker 数（I/O 密集型，受出口带宽与对象存储限流约束）。
+  # 8 核 VM 建议 8~16；同机/单链路 S3 取小值更稳，避免触发 503 SlowDown 导致整包发布失败。
+  workers: 16
+
+gc:
+  enabled: true
+  interval: 1h
+  # 孤儿对象回收宽限期：判定可删除后需再等这么久才真正物理删除（含失败上传残留、手动软删除及超窗版本的对象），用于避免误删。
+  orphan_grace: 2h
+  # 版本保留窗口，二者为「或」关系：满足任一条件即保留，只有同时不满足才被回收。
+  #   keep_versions: 保留最新 N 个 ready 版本（按发布时间从新到旧计，0=不按数量保留）
+  #   keep_days:     保留最近 N 天的版本（0=不按时间保留）
+  # 两者都为 0 时不删除任何版本。
+  # 注意：单独用 keep_versions（keep_days=0）时，若一天内发布超过 N 个版本，
+  # 旧版本会立即被回收，即使刚发布不久；建议两个都设置取并集更稳妥。
+  # 另外，current 版本、被 binding 固定的版本、被活跃分享链接引用的版本、
+  # 以及 Protected 标记的版本始终受保护，不计入上述窗口，也不受删除影响。
+  # 以上为全局默认；每个项目可在项目配置中单独设置 keep_versions / keep_days（留空继承本全局值，
+  # 项目有设置时以项目设置为准，项目优先级高于此处全局配置）。
+  keep_versions: 20
+  keep_days: 0
+
+log:
+  # 主日志输出路径（除 HTTP 请求日志外的全部日志）；留空则只输出到 stdout
+  file: "./logs/control.log"
+  # HTTP 请求访问日志输出路径；留空则只输出到 stdout。注意不要与 proxy 的 access.log/error.log 重名
+  access_file: "./logs/control-access.log"
+  # 日志级别（两个通道共用）：debug / info / warn / error；可用 PAGEFORGE_LOG_LEVEL 覆盖
+  level: info
+  # 按天轮转（control-YYYY-MM-DD.log / control-access-YYYY-MM-DD.log），保留天数；0 表示不删除
+  max_age_days: 30
