@@ -9,3 +9,4 @@ testdata/tmp/
 *.db
 /logs/
 bin/logs/
+bin/cache/
