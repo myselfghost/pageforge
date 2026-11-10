@@ -48,7 +48,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /internal/v1/snapshot", s.authorize(http.HandlerFunc(s.getSnapshot)))
 	mux.Handle("POST /internal/v1/reload", s.authorize(http.HandlerFunc(s.reload)))
 	mux.Handle("GET /internal/v1/aliases/{id}/credentials", s.authorize(http.HandlerFunc(s.credentials)))
+	mux.Handle("GET /internal/v1/alias-credentials", s.authorize(http.HandlerFunc(s.aliasCredentials)))
 	mux.Handle("GET /internal/v1/auth-policies", s.authorize(http.HandlerFunc(s.authPolicies)))
+	mux.Handle("GET /internal/v1/share-links", s.authorize(http.HandlerFunc(s.shareDirectory)))
+	mux.Handle("POST /internal/v1/share-links/{token}/views", s.authorize(http.HandlerFunc(s.addShareViews)))
 	mux.Handle("POST /internal/v1/share-links/{token}/authorize", s.authorize(http.HandlerFunc(s.authorizeShare)))
 	return mux
 }
@@ -58,6 +61,66 @@ func (s *Server) Handler() http.Handler {
 type shareAuthorizeRequest struct {
 	Password  string `json:"password"`
 	CountView bool   `json:"count_view"`
+}
+
+// aliasCredentials serves every alias's credentials in one response so the data
+// plane can mirror them beside the snapshot instead of calling per request.
+func (s *Server) aliasCredentials(w http.ResponseWriter, r *http.Request) {
+	if s.Aliases == nil {
+		writeError(w, http.StatusServiceUnavailable, "CREDENTIALS_UNAVAILABLE", "aliases are not configured")
+		return
+	}
+	dir, err := s.Aliases.Directory(r.Context())
+	if err != nil {
+		s.LoggerOr().Error("credential directory failed", slog.String("error", err.Error()))
+		writeError(w, http.StatusInternalServerError, "CREDENTIALS_FAILED", "credential directory failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, dir)
+}
+
+// shareDirectory serves every share link's authorization material so the data
+// plane can authorize offline. It carries password hashes, so it is never
+// logged and stays behind the internal token.
+func (s *Server) shareDirectory(w http.ResponseWriter, r *http.Request) {
+	if s.Shares == nil {
+		writeError(w, http.StatusServiceUnavailable, "SHARE_LINKS_UNAVAILABLE", "share links are not configured")
+		return
+	}
+	dir, err := s.Shares.Directory(r.Context())
+	if err != nil {
+		s.LoggerOr().Error("share directory failed", slog.String("error", err.Error()))
+		writeError(w, http.StatusInternalServerError, "SHARE_DIRECTORY_FAILED", "share directory failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, dir)
+}
+
+// shareViewsRequest is the data-plane view-count write-back payload.
+type shareViewsRequest struct {
+	Count int64 `json:"count"`
+}
+
+// addShareViews applies a data-plane view-count flush. The data plane counts
+// views locally while it is offline, so this endpoint accepts the increment
+// without re-authorizing the token.
+func (s *Server) addShareViews(w http.ResponseWriter, r *http.Request) {
+	if s.Shares == nil {
+		writeError(w, http.StatusNotImplemented, "SHARE_LINKS_UNAVAILABLE", "share links are not configured")
+		return
+	}
+	var req shareViewsRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body")
+		return
+	}
+	if err := s.Shares.AddViews(r.Context(), r.PathValue("token"), req.Count); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) authorizeShare(w http.ResponseWriter, r *http.Request) {
@@ -168,10 +231,11 @@ func (s *Server) reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]uint64{"generation": snap.Generation})
 }
 
-// credentialsResponse must never be logged: it carries plaintext secrets.
+// credentialsResponse mirrors the stored alias row: the secret stays sealed and
+// the data plane decrypts it locally, so plaintext never leaves this endpoint.
 type credentialsResponse struct {
 	AccessKey     string `json:"access_key"`
-	SecretKey     string `json:"secret_key"`
+	SecretCipher  []byte `json:"secret_cipher"`
 	CredentialVer int64  `json:"credential_version"`
 }
 
@@ -198,15 +262,9 @@ func (s *Server) credentials(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "ALIAS_NOT_FOUND", "alias not found")
 		return
 	}
-	_, secret, err := s.Aliases.Secret(r.Context(), id)
-	if err != nil {
-		s.LoggerOr().Error("decrypt alias credentials", slog.String("alias_id", id), slog.String("error", err.Error()))
-		writeError(w, http.StatusInternalServerError, "CREDENTIALS_FAILED", "failed to load credentials")
-		return
-	}
 	writeJSON(w, http.StatusOK, credentialsResponse{
 		AccessKey:     a.AccessKey,
-		SecretKey:     secret,
+		SecretCipher:  a.SecretCipher,
 		CredentialVer: a.CredentialVer,
 	})
 }

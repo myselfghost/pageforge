@@ -37,9 +37,9 @@ const (
 // from magic bytes when mode is omitted; they are accepted as explicit values
 // for backwards compatibility.
 const (
-	ModeZip  = "zip"
-	ModeTar  = "tar"
-	ModeTgz  = "tgz"
+	ModeZip = "zip"
+	ModeTar = "tar"
+	ModeTgz = "tgz"
 )
 
 const defaultIndexDoc = "index.html"

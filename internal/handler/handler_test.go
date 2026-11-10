@@ -167,6 +167,27 @@ func newFixtureWithOptions(t *testing.T, mutate func(*snapshot.Snapshot), optsFn
 		snap: snap, handler: handler.New(opts)}
 }
 
+func TestDisabledBindingFallsBackToRootRoute(t *testing.T) {
+	f := newFixture(t, nil)
+	f.update(func(s *snapshot.Snapshot) {
+		s.Bindings = append(s.Bindings, snapshot.BindingView{
+			ID: "bnd_ai", Host: testHost, PathPrefix: "/ai-feng", ProjectID: testPID, Enabled: false,
+		})
+	})
+
+	// 停用前缀下的请求回退到同主机根绑定，并按根项目解析 /ai-feng/ 目录。
+	if rec := f.do(http.MethodGet, "/ai-feng/", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("path under disabled prefix = %d, want 404 from the root project", rec.Code)
+	}
+	rec := f.do(http.MethodGet, "/ai-feng/assets/app.js", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled prefix object = %d, want 404 from the root project", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/", nil); rec.Code != http.StatusOK {
+		t.Fatalf("root route = %d, want 200", rec.Code)
+	}
+}
+
 func (f *fixture) do(method, target string, headers map[string]string) *httptest.ResponseRecorder {
 	f.t.Helper()
 	req := httptest.NewRequest(method, "http://"+testHost+target, nil)

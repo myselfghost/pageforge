@@ -38,4 +38,3 @@ func TestPutUserMetadata(t *testing.T) {
 		}
 	})
 }
-

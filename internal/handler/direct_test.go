@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/pageforge/pageforge/internal/handler"
 	"github.com/pageforge/pageforge/internal/model"
@@ -225,7 +228,58 @@ func TestShareLinkPassesPasswordHeader(t *testing.T) {
 func TestShareLinkWithoutAuthorizer(t *testing.T) {
 	f := newFixture(t, nil)
 	rec := f.do(http.MethodGet, "/__pageforge/s/tok_1/", nil)
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501", rec.Code)
+	// The local authorizer is configured but the share directory has not been
+	// polled yet, so the link cannot be validated.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+// 分享链接在本地目录可用时必须离线可用：control 停机也要能继续服务。
+func TestShareLinkServesOfflineFromDirectory(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("s3cret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	expired := time.Now().Add(-time.Hour).UTC()
+	f := newFixtureWithOptions(t, nil, func(opts *handler.Options) {
+		// No ControlURL: the authorizer must work from the mirrored directory.
+		opts.ControlURL = ""
+		opts.Snapshots.ReplaceShares(&snapshot.ShareDirectory{Links: map[string]snapshot.ShareLinkSecrets{
+			"tok_open":   {ID: "shr_open", ProjectID: testPID, Enabled: true},
+			"tok_locked": {ID: "shr_locked", ProjectID: testPID, Enabled: true, PasswordHash: string(hash)},
+			"tok_off":    {ID: "shr_off", ProjectID: testPID, Enabled: false},
+			"tok_exp":    {ID: "shr_exp", ProjectID: testPID, Enabled: true, ExpiresAt: &expired},
+			"tok_full":   {ID: "shr_full", ProjectID: testPID, Enabled: true, MaxViews: 3, Views: 3},
+		}})
+	})
+
+	// An open link serves the project with no control-plane call at all.
+	rec := f.do(http.MethodGet, "/__pageforge/s/tok_open/", nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != "<h1>index</h1>" {
+		t.Fatalf("open share = %d %q", rec.Code, rec.Body.String())
+	}
+
+	// A password-protected link challenges, then serves with the right password.
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_locked/", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("locked share without password = %d", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_locked/",
+		map[string]string{"X-Share-Password": "s3cret"}); rec.Code != http.StatusOK {
+		t.Fatalf("locked share with password = %d", rec.Code)
+	}
+
+	// Disabled, expired and over-budget links keep their control-plane codes.
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_off/", nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("disabled share = %d, want 403", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_exp/", nil); rec.Code != http.StatusGone {
+		t.Fatalf("expired share = %d, want 410", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_full/", nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("exhausted share = %d, want 403", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/__pageforge/s/tok_missing/", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown share = %d, want 404", rec.Code)
 	}
 }

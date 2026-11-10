@@ -2,34 +2,32 @@ package credential_test
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 
 	"github.com/pageforge/pageforge/internal/credential"
+	"github.com/pageforge/pageforge/internal/crypto"
 	"github.com/pageforge/pageforge/internal/snapshot"
+	"github.com/pageforge/pageforge/internal/testutil"
 )
 
-func TestClientCachesByCredentialVersion(t *testing.T) {
-	var calls int32
-	version := int64(1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		if r.Header.Get("Authorization") != "Bearer internal-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_key":         "AKIA",
-			"secret_key":         "secret",
-			"credential_version": version,
-		})
-	}))
-	defer server.Close()
+// sealed 返回与数据库一致的密文，模拟控制面下发的 secret_cipher。
+func sealed(t *testing.T, cipher *crypto.Cipher, secret string) []byte {
+	t.Helper()
+	body, err := cipher.EncryptString(secret)
+	if err != nil {
+		t.Fatalf("seal secret: %v", err)
+	}
+	return body
+}
 
-	client := credential.NewClient(server.URL, "internal-token")
+func TestClientDecryptsMirroredCiphertext(t *testing.T) {
+	cipher := testutil.NewCipher(t)
+	store := snapshot.NewStore()
+	store.ReplaceCredentials(&snapshot.CredentialDirectory{Aliases: map[string]snapshot.AliasCredentials{
+		"ali_1": {AccessKey: "AKIA", SecretCipher: sealed(t, cipher, "secret"), CredentialVer: 1},
+	}})
+
+	client := credential.NewClient(store, cipher)
 	view := snapshot.AliasView{Endpoint: "https://s3.example.com", Region: "us-east-1", CredentialVer: 1}
 	ctx := context.Background()
 
@@ -44,30 +42,81 @@ func TestClientCachesByCredentialVersion(t *testing.T) {
 	if first != second {
 		t.Fatal("store should be reused for the same credential version")
 	}
-	if calls != 1 {
-		t.Fatalf("credential fetches = %d, want 1", calls)
-	}
 
-	version = 2
+	// A newer directory version replaces the object store, since the key pair
+	// changed.
+	store.ReplaceCredentials(&snapshot.CredentialDirectory{Aliases: map[string]snapshot.AliasCredentials{
+		"ali_1": {AccessKey: "AKIA", SecretCipher: sealed(t, cipher, "rotated"), CredentialVer: 2},
+	}})
 	view.CredentialVer = 2
-	if _, err := client.Store(ctx, "ali_1", view); err != nil {
+	third, err := client.Store(ctx, "ali_1", view)
+	if err != nil {
 		t.Fatalf("third store: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("credential fetches = %d, want 2 after version bump", calls)
+	if third == first {
+		t.Fatal("a rotated credential version must build a new store")
 	}
 }
 
-func TestClientFailsWhenControlPlaneRejects(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer server.Close()
+func TestClientRejectsStaleAndMissingCredentials(t *testing.T) {
+	cipher := testutil.NewCipher(t)
+	store := snapshot.NewStore()
+	store.ReplaceCredentials(&snapshot.CredentialDirectory{Aliases: map[string]snapshot.AliasCredentials{
+		"ali_1": {AccessKey: "AKIA", SecretCipher: sealed(t, cipher, "secret"), CredentialVer: 1},
+	}})
+	client := credential.NewClient(store, cipher)
+	ctx := context.Background()
 
-	client := credential.NewClient(server.URL, "bad-token")
-	if _, err := client.Store(context.Background(), "ali_1", snapshot.AliasView{
+	// The snapshot demands a version the directory does not carry yet.
+	if _, err := client.Store(ctx, "ali_1", snapshot.AliasView{
+		Endpoint: "https://s3.example.com", CredentialVer: 2,
+	}); err == nil {
+		t.Fatal("credentials older than the snapshot version must be rejected")
+	}
+	if _, err := client.Store(ctx, "ali_missing", snapshot.AliasView{
 		Endpoint: "https://s3.example.com", CredentialVer: 1,
 	}); err == nil {
-		t.Fatal("expected credential fetch error")
+		t.Fatal("an unknown alias must fail")
+	}
+	if client.Healthy("ali_1", 1) != true || client.Healthy("ali_1", 2) != false {
+		t.Fatal("Healthy must mirror the version check")
+	}
+}
+
+func TestClientWithoutDirectoryOrKeyFailsAndNeverCallsOut(t *testing.T) {
+	if _, err := credential.NewClient(nil, testutil.NewCipher(t)).Store(context.Background(), "ali_1",
+		snapshot.AliasView{Endpoint: "https://s3.example.com", CredentialVer: 1}); err == nil {
+		t.Fatal("a client without a directory must fail rather than reach the network")
+	}
+
+	// Without the master key the sealed secret cannot be opened, so the request
+	// must fail instead of signing with garbage.
+	store := snapshot.NewStore()
+	store.ReplaceCredentials(&snapshot.CredentialDirectory{Aliases: map[string]snapshot.AliasCredentials{
+		"ali_1": {AccessKey: "AKIA", SecretCipher: []byte("sealed"), CredentialVer: 1},
+	}})
+	if _, err := credential.NewClient(store, nil).Store(context.Background(), "ali_1",
+		snapshot.AliasView{Endpoint: "https://s3.example.com", CredentialVer: 1}); err == nil {
+		t.Fatal("a client without a master key must fail")
+	}
+}
+
+func TestClientRejectsSecretSealedWithAnotherKey(t *testing.T) {
+	controlKey, err := crypto.NewFromBase64("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	if err != nil {
+		t.Fatalf("build control cipher: %v", err)
+	}
+	otherKey, err := crypto.NewFromBase64("YWJjZGVmZ2hpamtsbW5vcGFiY2RlZmdoaWprbG1ub3A=")
+	if err != nil {
+		t.Fatalf("build other cipher: %v", err)
+	}
+
+	store := snapshot.NewStore()
+	store.ReplaceCredentials(&snapshot.CredentialDirectory{Aliases: map[string]snapshot.AliasCredentials{
+		"ali_1": {AccessKey: "AKIA", SecretCipher: sealed(t, controlKey, "secret"), CredentialVer: 1},
+	}})
+	if _, err := credential.NewClient(store, otherKey).Store(context.Background(), "ali_1",
+		snapshot.AliasView{Endpoint: "https://s3.example.com", CredentialVer: 1}); err == nil {
+		t.Fatal("a mismatched master key must surface as a decrypt error")
 	}
 }

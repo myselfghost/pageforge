@@ -1,123 +1,118 @@
-// Package credential resolves S3 credentials for aliases from the control
-// plane and caches the resulting object stores per credential version.
+// Package credential resolves S3 credentials for aliases from the directory the
+// poller mirrors beside the snapshot, and caches the resulting object stores per
+// credential version. It never talks to the control plane itself.
 package credential
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"strings"
-	"sync"
+	"log/slog"
 	"time"
 
+	"github.com/pageforge/pageforge/internal/crypto"
 	"github.com/pageforge/pageforge/internal/objectstore"
 	"github.com/pageforge/pageforge/internal/snapshot"
 )
 
-// Credentials is the internal API response. It must never be logged.
-type Credentials struct {
-	AccessKey     string `json:"access_key"`
-	SecretKey     string `json:"secret_key"`
-	CredentialVer int64  `json:"credential_version"`
+// DirectorySource is the credential directory the poller keeps in memory.
+type DirectorySource interface {
+	Credentials() *snapshot.CredentialDirectory
 }
 
-// Client fetches and caches alias credentials.
+// Client resolves object stores from the mirrored credential directory. Secrets
+// arrive AES-256-GCM sealed (identical to the control-plane database) and are
+// decrypted in memory here, so plaintext never touches disk on either side.
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
-	Pool    *objectstore.Pool
+	Dir  DirectorySource
+	Pool *objectstore.Pool
+	// Cipher decrypts the mirrored secrets. It must match the control plane's
+	// master key; a nil cipher makes every lookup fail.
+	Cipher *crypto.Cipher
 
 	// ConnectTimeout bounds TCP/TLS connect to the S3 endpoint.
 	ConnectTimeout time.Duration
 	// ReadTimeout bounds waiting for the first response byte from S3.
 	ReadTimeout time.Duration
 
-	mu    sync.Mutex
-	cache map[string]Credentials
+	Logger *slog.Logger
 }
 
-// NewClient builds a credential client. baseURL points at the control plane.
-func NewClient(baseURL, token string) *Client {
+// NewClient builds a credential client reading dir and decrypting with cipher.
+// A nil dir or cipher makes every lookup fail with ErrCredentialsUnavailable.
+func NewClient(dir DirectorySource, cipher *crypto.Cipher) *Client {
 	return &Client{
-		BaseURL: strings.TrimSuffix(baseURL, "/"),
-		Token:   token,
-		HTTP:    &http.Client{Timeout: 10 * time.Second},
-		Pool:    objectstore.NewPool(),
-		cache:   map[string]Credentials{},
+		Dir:    dir,
+		Pool:   objectstore.NewPool(),
+		Cipher: cipher,
+		Logger: slog.Default(),
 	}
 }
 
-// Store returns an object store for the alias, refetching credentials when the
-// snapshot's credential version is newer than the cached one.
-func (c *Client) Store(ctx context.Context, aliasID string, view snapshot.AliasView) (objectstore.ObjectStore, error) {
-	creds, ok := c.cached(aliasID, view.CredentialVer)
+var (
+	// ErrCredentialsUnavailable means the alias has no mirrored credentials, which
+	// usually means the alias was created after the last successful poll.
+	ErrCredentialsUnavailable = errors.New("alias credentials are not loaded")
+	// ErrMasterKeyMissing means no master key was configured, so mirrored
+	// ciphertext cannot be decrypted.
+	ErrMasterKeyMissing = errors.New("master_key is required to decrypt alias credentials")
+)
+
+// Store returns an object store for the alias at the snapshot's credential
+// version. Decryption happens here in memory; no I/O reaches the control plane.
+func (c *Client) Store(_ context.Context, aliasID string, view snapshot.AliasView) (objectstore.ObjectStore, error) {
+	creds, ok := c.lookup(aliasID, view.CredentialVer)
 	if !ok {
-		fetched, err := c.Fetch(ctx, aliasID)
-		if err != nil {
-			return nil, err
-		}
-		creds = fetched
-		c.remember(aliasID, fetched)
+		return nil, fmt.Errorf("%w: alias %s", ErrCredentialsUnavailable, aliasID)
+	}
+	secret, err := c.decrypt(creds)
+	if err != nil {
+		return nil, fmt.Errorf("alias %s: %w", aliasID, err)
 	}
 	return c.Pool.Get(aliasID, creds.CredentialVer, objectstore.Credentials{
 		Endpoint:       view.Endpoint,
 		Region:         view.Region,
 		AccessKey:      creds.AccessKey,
-		SecretKey:      creds.SecretKey,
+		SecretKey:      secret,
 		PathStyle:      view.PathStyle,
 		ConnectTimeout: c.ConnectTimeout,
 		ReadTimeout:    c.ReadTimeout,
 	})
 }
 
-// Fetch retrieves credentials from the control plane.
-func (c *Client) Fetch(ctx context.Context, aliasID string) (Credentials, error) {
-	url := c.BaseURL + "/internal/v1/aliases/" + aliasID + "/credentials"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// decrypt opens the sealed secret. Caught here so a mismatched master key
+// surfaces as one clear error instead of a storage signature failure.
+func (c *Client) decrypt(creds snapshot.AliasCredentials) (string, error) {
+	if c.Cipher == nil {
+		return "", ErrMasterKeyMissing
+	}
+	secret, err := c.Cipher.DecryptString(creds.SecretCipher)
 	if err != nil {
-		return Credentials{}, fmt.Errorf("build credentials request: %w", err)
+		return "", fmt.Errorf("decrypt secret: %w", err)
 	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return Credentials{}, fmt.Errorf("fetch credentials: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return Credentials{}, fmt.Errorf("credentials endpoint returned %s", resp.Status)
-	}
-	var creds Credentials
-	if err := json.NewDecoder(resp.Body).Decode(&creds); err != nil {
-		return Credentials{}, fmt.Errorf("decode credentials: %w", err)
-	}
-	if creds.AccessKey == "" || creds.SecretKey == "" {
-		return Credentials{}, fmt.Errorf("credentials for alias %s are empty", aliasID)
-	}
-	return creds, nil
+	return secret, nil
 }
 
-func (c *Client) cached(aliasID string, version int64) (Credentials, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	creds, ok := c.cache[aliasID]
+// lookup returns the mirrored credentials for the alias. Credentials older than
+// the snapshot's version are rejected: they belong to a superseded key pair.
+func (c *Client) lookup(aliasID string, version int64) (snapshot.AliasCredentials, bool) {
+	if c.Dir == nil {
+		return snapshot.AliasCredentials{}, false
+	}
+	dir := c.Dir.Credentials()
+	if dir == nil {
+		return snapshot.AliasCredentials{}, false
+	}
+	creds, ok := dir.Aliases[aliasID]
 	if !ok || creds.CredentialVer < version {
-		return Credentials{}, false
+		return snapshot.AliasCredentials{}, false
 	}
 	return creds, true
 }
 
-func (c *Client) remember(aliasID string, creds Credentials) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cache == nil {
-		c.cache = map[string]Credentials{}
-	}
-	if existing, ok := c.cache[aliasID]; ok && existing.CredentialVer > creds.CredentialVer {
-		return
-	}
-	c.cache[aliasID] = creds
+// Healthy reports whether the alias can be served, so callers can log or gate
+// without building an object store.
+func (c *Client) Healthy(aliasID string, version int64) bool {
+	_, ok := c.lookup(aliasID, version)
+	return ok && c.Cipher != nil
 }

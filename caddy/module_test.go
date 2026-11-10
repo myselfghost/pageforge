@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -133,8 +134,25 @@ func TestUnmarshalCaddyfileRejectsNonPositiveCacheTTL(t *testing.T) {
 	}
 }
 
-func TestProvisionDefaultsCacheTTL(t *testing.T) {
+// testMasterKey is a valid 32-byte AES key in base64, matching testutil.
+const testMasterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+func TestProvisionRequiresMasterKey(t *testing.T) {
 	m := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge"}
+	if err := m.Provision(caddy.Context{Context: context.Background()}); err == nil {
+		t.Fatal("Provision must fail without master_key: sealed secrets cannot be decrypted")
+	}
+	defer func() { _ = m.Cleanup() }()
+
+	bad := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge", MasterKey: "not-base64"}
+	if err := bad.Provision(caddy.Context{Context: context.Background()}); err == nil {
+		t.Fatal("Provision must reject a malformed master_key")
+	}
+	defer func() { _ = bad.Cleanup() }()
+}
+
+func TestProvisionDefaultsCacheTTL(t *testing.T) {
+	m := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge", MasterKey: testMasterKey}
 	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -151,6 +169,7 @@ func TestProvisionDefaultsCacheBudget(t *testing.T) {
 	m := S3Static{
 		ControlURL:     "http://127.0.0.1:8081",
 		ReservedPrefix: "/__pageforge",
+		MasterKey:      testMasterKey,
 		CacheDir:       t.TempDir(),
 	}
 	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
@@ -175,7 +194,7 @@ func TestUnmarshalCaddyfileRejectsBadEvictRatio(t *testing.T) {
 }
 
 func TestProvisionDefaultsManifestCache(t *testing.T) {
-	m := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge"}
+	m := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge", MasterKey: testMasterKey}
 	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -245,5 +264,57 @@ func TestValidateRequiresControlURL(t *testing.T) {
 	}
 	if err := (&S3Static{ReservedPrefix: "/__pageforge", ControlURL: "http://127.0.0.1:8081", CacheMaxBytes: -1}).Validate(); err == nil {
 		t.Fatal("negative cache_max_bytes must fail validation")
+	}
+}
+
+func TestProvisionDoesNotDeriveSnapshotCacheDirFromObjectCache(t *testing.T) {
+	dir := t.TempDir()
+	m := S3Static{
+		ControlURL:     "http://127.0.0.1:8081",
+		ReservedPrefix: "/__pageforge",
+		MasterKey:      testMasterKey,
+		CacheDir:       dir,
+	}
+	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer func() { _ = m.Cleanup() }()
+	if m.SnapshotCacheDir != "" {
+		t.Fatalf("snapshot_cache_dir = %q, want empty even with cache_dir set: mirrors must not be written without an explicit path", m.SnapshotCacheDir)
+	}
+	if entries, err := os.ReadDir(dir); err != nil {
+		t.Fatalf("read cache dir: %v", err)
+	} else {
+		for _, entry := range entries {
+			if entry.Name() == ".snapshot" {
+				t.Fatal("no snapshot mirror directory must be created under cache_dir")
+			}
+		}
+	}
+
+	explicit := S3Static{
+		ControlURL:       "http://127.0.0.1:8081",
+		ReservedPrefix:   "/__pageforge",
+		MasterKey:        testMasterKey,
+		CacheDir:         dir,
+		SnapshotCacheDir: t.TempDir(),
+	}
+	if err := explicit.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer func() { _ = explicit.Cleanup() }()
+	if explicit.SnapshotCacheDir == "" {
+		t.Fatal("explicit snapshot_cache_dir must be kept")
+	}
+}
+
+func TestProvisionLeavesSnapshotCacheDisabledWithoutCacheDir(t *testing.T) {
+	m := S3Static{ControlURL: "http://127.0.0.1:8081", ReservedPrefix: "/__pageforge", MasterKey: testMasterKey}
+	if err := m.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer func() { _ = m.Cleanup() }()
+	if m.SnapshotCacheDir != "" {
+		t.Fatalf("snapshot_cache_dir = %q, want empty", m.SnapshotCacheDir)
 	}
 }

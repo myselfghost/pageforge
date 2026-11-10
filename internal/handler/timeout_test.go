@@ -183,12 +183,12 @@ func TestClientIdleTimeoutAllowsSteadyTransfer(t *testing.T) {
 // stallingWriter blocks on the first Write until released, then reports how many
 // bytes the handler attempted to write, to prove the client idle watchdog fired.
 type stallingWriter struct {
-	header          http.Header
-	mu              sync.Mutex
-	written         int
-	release         chan struct{}
-	blockOnFirst    bool
-	blockedOnce     int32
+	header       http.Header
+	mu           sync.Mutex
+	written      int
+	release      chan struct{}
+	blockOnFirst bool
+	blockedOnce  int32
 }
 
 func newStallingWriter() *stallingWriter {

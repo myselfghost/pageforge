@@ -13,7 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/pageforge/pageforge/internal/httpx"
 	"github.com/pageforge/pageforge/internal/model"
@@ -50,34 +53,135 @@ type ShareAuthorizer interface {
 	Authorize(ctx context.Context, token, password string, countView bool) (ShareGrant, error)
 }
 
-type controlShareAuthorizer struct {
+// shareDirectorySource is the share-link directory the poller keeps in memory.
+type shareDirectorySource interface {
+	Shares() *snapshot.ShareDirectory
+}
+
+// localShareAuthorizer validates share links from the mirrored directory, so an
+// offline data plane keeps serving. View counting is deliberately conservative:
+// a locally counted view is only released once an updated directory shows the
+// control plane has consumed it, so an ambiguous write-back can never grant
+// extra views.
+type localShareAuthorizer struct {
+	dir     shareDirectorySource
+	client  *http.Client
 	baseURL string
 	token   string
-	client  *http.Client
+
+	mu sync.Mutex
+	// pending holds locally counted views not yet reflected in the directory.
+	pending map[string]int64
+	// sent is the part of pending already dispatched to the control plane, so a
+	// retry never sends the same view twice.
+	sent map[string]int64
+	// seen is the last directory total observed per token, used to detect when
+	// the control plane has absorbed the dispatched count.
+	seen map[string]int64
 }
 
-func newControlShareAuthorizer(controlURL, token string) *controlShareAuthorizer {
-	return &controlShareAuthorizer{
+func newLocalShareAuthorizer(dir shareDirectorySource, controlURL, token string) *localShareAuthorizer {
+	return &localShareAuthorizer{
+		dir:     dir,
+		client:  &http.Client{Timeout: 5 * time.Second},
 		baseURL: strings.TrimSuffix(controlURL, "/"),
 		token:   token,
-		client:  &http.Client{Timeout: 5 * time.Second},
+		pending: map[string]int64{},
+		sent:    map[string]int64{},
+		seen:    map[string]int64{},
 	}
 }
 
-type shareAuthorizeBody struct {
-	Password  string `json:"password"`
-	CountView bool   `json:"count_view"`
+// Authorize validates the token against the mirrored directory. When the
+// directory is missing, the control plane is tried so an unrefreshed data plane
+// still works rather than failing every share link.
+func (a *localShareAuthorizer) Authorize(ctx context.Context, token, password string, countView bool) (ShareGrant, error) {
+	dir := a.dir.Shares()
+	if dir == nil {
+		if a.baseURL == "" {
+			return ShareGrant{}, &ShareAuthError{Status: http.StatusServiceUnavailable, Code: "SHARE_LINKS_UNAVAILABLE", Message: "share links are not loaded"}
+		}
+		return controlAuthorize(ctx, a.client, a.baseURL, a.token, token, password, countView)
+	}
+	link, ok := dir.Links[token]
+	if !ok {
+		return ShareGrant{}, &ShareAuthError{Status: http.StatusNotFound, Code: "SHARE_LINK_NOT_FOUND", Message: "share link not found"}
+	}
+	now := time.Now().UTC()
+	if !link.Enabled {
+		return ShareGrant{}, &ShareAuthError{Status: http.StatusForbidden, Code: "SHARE_DISABLED", Message: "share link is disabled"}
+	}
+	if link.ExpiresAt != nil && !now.Before(*link.ExpiresAt) {
+		return ShareGrant{}, &ShareAuthError{Status: http.StatusGone, Code: "SHARE_EXPIRED", Message: "share link has expired"}
+	}
+	if link.PasswordHash != "" {
+		if password == "" {
+			return ShareGrant{}, &ShareAuthError{Status: http.StatusUnauthorized, Code: "SHARE_PASSWORD_REQUIRED", Message: "share link requires a password"}
+		}
+		if bcrypt.CompareHashAndPassword([]byte(link.PasswordHash), []byte(password)) != nil {
+			return ShareGrant{}, &ShareAuthError{Status: http.StatusUnauthorized, Code: "SHARE_PASSWORD_INVALID", Message: "share link password is invalid"}
+		}
+	}
+
+	a.mu.Lock()
+	// The directory total growing means the control plane consumed an earlier
+	// write-back; release the matching pending count so it is not counted twice.
+	if prev, ok := a.seen[token]; ok && link.Views > prev {
+		delta := link.Views - prev
+		if delta >= a.pending[token] {
+			delete(a.pending, token)
+			delete(a.sent, token)
+		} else {
+			a.pending[token] -= delta
+			if a.sent[token] > a.pending[token] {
+				a.sent[token] = a.pending[token]
+			}
+		}
+	}
+	a.seen[token] = link.Views
+	pending := a.pending[token]
+	if countView {
+		a.pending[token] = pending + 1
+	}
+	a.mu.Unlock()
+
+	if link.MaxViews > 0 && link.Views+pending >= link.MaxViews {
+		return ShareGrant{}, &ShareAuthError{Status: http.StatusForbidden, Code: "SHARE_VIEWS_EXCEEDED", Message: "share link view limit reached"}
+	}
+	if countView {
+		go a.flush(token)
+	}
+	return ShareGrant{ProjectID: link.ProjectID, VersionID: link.VersionID, Cache: link.Cache}, nil
 }
 
-func (a *controlShareAuthorizer) Authorize(ctx context.Context, token, password string, countView bool) (ShareGrant, error) {
-	payload, err := json.Marshal(shareAuthorizeBody{Password: password, CountView: countView})
+// flush dispatches only the not-yet-sent part of the pending count off the
+// request path. The count stays pending until a later directory refresh shows
+// the control plane absorbed it, so a write-back that fails or is ambiguous is
+// retried. A duplicate send can only over-count, which is the safe direction for
+// a view budget.
+func (a *localShareAuthorizer) flush(token string) {
+	if a.baseURL == "" {
+		return
+	}
+	a.mu.Lock()
+	count := a.pending[token] - a.sent[token]
+	if count <= 0 {
+		a.mu.Unlock()
+		return
+	}
+	a.sent[token] += count
+	a.mu.Unlock()
+
+	payload, err := json.Marshal(shareCountBody{Count: count})
 	if err != nil {
-		return ShareGrant{}, err
+		return
 	}
-	endpoint := a.baseURL + "/internal/v1/share-links/" + url.PathEscape(token) + "/authorize"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	endpoint := a.baseURL + "/internal/v1/share-links/" + url.PathEscape(token) + "/views"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return ShareGrant{}, err
+		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if a.token != "" {
@@ -85,6 +189,54 @@ func (a *controlShareAuthorizer) Authorize(ctx context.Context, token, password 
 		req.Header.Set("Authorization", "Bearer "+a.token)
 	}
 	resp, err := a.client.Do(req)
+	if err != nil {
+		a.rollback(token, count)
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		a.rollback(token, count)
+	}
+}
+
+// rollback re-arms a failed dispatch for the next view.
+func (a *localShareAuthorizer) rollback(token string, count int64) {
+	a.mu.Lock()
+	a.sent[token] -= count
+	if a.sent[token] < 0 {
+		delete(a.sent, token)
+	}
+	a.mu.Unlock()
+}
+
+// shareCountBody is the POST /internal/v1/share-links/{token}/views payload.
+type shareCountBody struct {
+	Count int64 `json:"count"`
+}
+
+type shareAuthorizeBody struct {
+	Password  string `json:"password"`
+	CountView bool   `json:"count_view"`
+}
+
+// controlAuthorize asks the control plane to validate a share request. It backs
+// the fallback used while the mirrored share directory has not been loaded yet.
+func controlAuthorize(ctx context.Context, client *http.Client, baseURL, token, shareToken, password string, countView bool) (ShareGrant, error) {
+	payload, err := json.Marshal(shareAuthorizeBody{Password: password, CountView: countView})
+	if err != nil {
+		return ShareGrant{}, err
+	}
+	endpoint := baseURL + "/internal/v1/share-links/" + url.PathEscape(shareToken) + "/authorize"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return ShareGrant{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-Internal-Token", token)
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return ShareGrant{}, err
 	}

@@ -32,11 +32,11 @@ type Project struct {
 	PackageRetention bool               `json:"package_retention"`
 	ResponseHeaders  []model.HeaderRule `json:"response_headers"`
 	// KeepVersions / KeepDays 为项目级版本保留策略，nil 表示继承全局 gc 配置。
-	KeepVersions     *int               `json:"keep_versions"`
-	KeepDays         *int               `json:"keep_days"`
-	Status           string             `json:"status"`
-	CreatedAt        time.Time          `json:"created_at"`
-	UpdatedAt        time.Time          `json:"updated_at"`
+	KeepVersions *int      `json:"keep_versions"`
+	KeepDays     *int      `json:"keep_days"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // OptionalInt 区分 JSON 字段「未提供」「显式 null」「具体值」三种状态，

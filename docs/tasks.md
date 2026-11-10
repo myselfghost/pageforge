@@ -75,7 +75,7 @@
 | ID | 任务 | 产出/涉及 | 依赖 | 验收 |
 |---|---|---|---|---|
 | M3-T1 | snapshot 生成与轮询 | 控制面 `internal/snapshot` 生成器 + `/internal/v1/snapshot`；`ProjectView`/`BindingView`/`AuthPolicyView` 类型定义；数据面 poller：2s、ETag、generation 单调、atomic.Pointer 原子替换、失败保留旧值 | M1-T3、M1-T5 | 变更后 ≤10s 生效；旧 snapshot 兜底（FR-10） |
-| M3-T2 | 内部凭证接口 | `/internal/v1/aliases/{id}/credentials`，token 鉴权，按 credential_version 失效 | M1-T3、M3-T1 | 凭证不进 snapshot/日志 |
+| M3-T2 | 内部凭证接口 | `/internal/v1/alias-credentials` 整目录下发（随快照轮询、数据面落盘镜像），`/internal/v1/aliases/{id}/credentials` 保留兼容，token 鉴权，按 credential_version 失效 | M1-T3、M3-T1 | 凭证不进 snapshot/日志；逐请求不再回源 control |
 | M3-T3 | 路由器 | `internal/router`：host exact/wildcard/`*` + path 段 trie + 根节点 fallback（`/` binding）；`enabled=false` 的 binding 排除 | M3-T1 | FR-05 全部验收用例（含托底、边界、冲突） |
 | M3-T4 | manifest reader | `internal/manifest` Reader：root/shard 统一加权 LRU（按解压字节、预算可配）、祖先路径选择 shard、singleflight、负缓存、可选 TTL、`Stats` | M3-T1、M2-T2 | 10 万文件仅加载命中 shard（S8 后半）；内存不超 `manifest_cache_max_bytes` |
 | M3-T5 | 请求生命周期 | `internal/handler`：保留前缀拦截（含 remainder 边界二次拦截）、exactLookup（根路径回退 index_doc）、try_files、SPA 判定、301、project disabled 503、404/error_doc、错误码 | M3-T3、M3-T4 | S1~S5；FR-06/FR-16 单测全过 |
@@ -109,7 +109,7 @@
 | ID | 需求 | 任务 | 产出/涉及 | 状态 | 验收 |
 |---|---|---|---|---|---|
 | M6-T1 | FR-17 | Web 管理界面（与控制面同进程） | `internal/webui`：go:embed 静态资源，`/` 由控制面进程直接提供；同源访问 admin API，无 CORS；覆盖别名/项目/绑定/发布/版本/日志指标 | 完成 | 单进程启动后浏览器可完成连接、建项目、发布、查看日志指标 |
-| M6-T2 | FR-18 | 分享链接 | 迁移 `0004_share_links`；`internal/share`（token、bcrypt 密码、过期、max_views、独立 cache）；API `/api/v1/share-links` CRUD；`/__pageforge/s/{token}/*`；内部 `/internal/v1/share-links/{token}/authorize` 校验并原子计数 | 完成 | 密码/过期/停用/超出次数分别返回 401/410/403/403；页面请求计数、静态资源不计数；分享缓存策略独立生效 |
+| M6-T2 | FR-18 | 分享链接 | 迁移 `0004_share_links`；`internal/share`（token、bcrypt 密码、过期、max_views、独立 cache）；API `/api/v1/share-links` CRUD；`/__pageforge/s/{token}/*`；内部 `/internal/v1/share-links` 目录下发 + `/views` 计数回写 + `/authorize` 兼容回退 | 完成 | 密码/过期/停用/超出次数分别返回 401/410/403/403；页面请求计数、静态资源不计数；分享缓存策略独立生效；control 停机时仍可离线鉴权 |
 | M6-T3 | FR-19 | 版本直链 | `/__pageforge/v/{project_id}/{version_id}/*` 独立路由；默认匿名，与 binding 鉴权无关；版本不存在/未 ready 返回 `VERSION_NOT_AVAILABLE` | 完成 | 旧版本直链不受指针切换影响；项目响应头规则在直链响应生效 |
 | M6-T4 | FR-20 | 原包下载 | `GET/HEAD /api/v1/projects/{id}/versions/{vid}/package`；仅 ready 且保留原包的项目可下载；`Content-Type: application/zip`、`Content-Disposition`、缺失返回 `PACKAGE_NOT_AVAILABLE` | 完成 | 下载内容与发布包一致；HEAD 无 body；未保留原包返回 404 |
 | M6-T5 | FR-21 | 响应头规则 | `model.HeaderRule.Replace *bool`；项目默认 + binding 覆盖合并；禁止列表跳过；`$project_id/$version_id/$binding_id/$request_id` 变量；301/404/SPA 响应均生效 | 完成 | 单测覆盖默认/覆盖/追加/禁止头/301/404；E2E 验证 200 与 404 均携带规则头 |

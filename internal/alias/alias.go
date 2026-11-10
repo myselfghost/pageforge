@@ -13,6 +13,7 @@ import (
 	"github.com/pageforge/pageforge/internal/crypto"
 	"github.com/pageforge/pageforge/internal/httpx"
 	"github.com/pageforge/pageforge/internal/ids"
+	"github.com/pageforge/pageforge/internal/snapshot"
 	"github.com/pageforge/pageforge/internal/store"
 )
 
@@ -314,6 +315,26 @@ func (r *Repo) Secret(ctx context.Context, id string) (string, string, error) {
 		return "", "", fmt.Errorf("decrypt secret: %w", err)
 	}
 	return a.AccessKey, secret, nil
+}
+
+// Directory returns every alias's credentials exactly as stored: the secret
+// stays AES-256-GCM sealed so the control plane never hands out plaintext. The
+// data plane decrypts in memory with the shared master key. The result must
+// never be logged.
+func (r *Repo) Directory(ctx context.Context) (snapshot.CredentialDirectory, error) {
+	aliases, err := r.List(ctx)
+	if err != nil {
+		return snapshot.CredentialDirectory{}, err
+	}
+	dir := snapshot.CredentialDirectory{Aliases: make(map[string]snapshot.AliasCredentials, len(aliases))}
+	for _, a := range aliases {
+		dir.Aliases[a.ID] = snapshot.AliasCredentials{
+			AccessKey:     a.AccessKey,
+			SecretCipher:  a.SecretCipher,
+			CredentialVer: a.CredentialVer,
+		}
+	}
+	return dir, nil
 }
 
 // AllowsBucket reports whether bucket is permitted by the alias allowlist.

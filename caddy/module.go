@@ -6,6 +6,7 @@ package s3static
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/pageforge/pageforge/internal/cache"
 	"github.com/pageforge/pageforge/internal/credential"
+	"github.com/pageforge/pageforge/internal/crypto"
 	"github.com/pageforge/pageforge/internal/handler"
 	"github.com/pageforge/pageforge/internal/manifest"
 	"github.com/pageforge/pageforge/internal/snapshot"
@@ -54,11 +56,19 @@ func init() {
 
 // S3Static is the data-plane handler module.
 type S3Static struct {
-	ControlURL            string         `json:"control_url,omitempty"`
-	InternalToken         string         `json:"internal_token,omitempty"`
-	InternalTokenFile     string         `json:"internal_token_file,omitempty"`
-	PollInterval          caddy.Duration `json:"poll_interval,omitempty"`
-	CacheDir              string         `json:"cache_dir,omitempty"`
+	ControlURL        string         `json:"control_url,omitempty"`
+	InternalToken     string         `json:"internal_token,omitempty"`
+	InternalTokenFile string         `json:"internal_token_file,omitempty"`
+	PollInterval      caddy.Duration `json:"poll_interval,omitempty"`
+	CacheDir          string         `json:"cache_dir,omitempty"`
+	// MasterKey is the base64 AES-256 key shared with the control plane. Alias
+	// secrets arrive sealed and are decrypted in memory, so it is required.
+	MasterKey     string `json:"master_key,omitempty"`
+	MasterKeyFile string `json:"master_key_file,omitempty"`
+	// SnapshotCacheDir mirrors the snapshot and its directories to disk so a
+	// restart survives an unreachable control plane. It is opt-in: empty disables
+	// the mirror entirely and no file is written, independent of CacheDir.
+	SnapshotCacheDir      string         `json:"snapshot_cache_dir,omitempty"`
 	CacheMaxBytes         int64          `json:"cache_max_bytes,omitempty"`
 	CacheTTL              caddy.Duration `json:"cache_ttl,omitempty"`
 	CacheEvictRatio       float64        `json:"cache_evict_ratio,omitempty"`
@@ -122,6 +132,9 @@ func (s *S3Static) Provision(ctx caddy.Context) error {
 	if s.ManifestCacheMaxBytes == 0 {
 		s.ManifestCacheMaxBytes = manifest.DefaultMaxBytes
 	}
+	// Snapshot mirror is opt-in: it uses snapshot_cache_dir only, never cache_dir.
+	// Leaving it empty keeps every mirror file (snapshot.json, auth-policies.json,
+	// aliases.json, shares.json) off disk.
 	if s.CacheMaxBytes < 0 {
 		return fmt.Errorf("cache_max_bytes must not be negative")
 	}
@@ -149,6 +162,24 @@ func (s *S3Static) Provision(ctx caddy.Context) error {
 		token = strings.TrimSpace(string(body))
 	}
 
+	// Alias secrets arrive sealed, so the master key must match the control
+	// plane's; without it no object store can be built.
+	masterKey := s.MasterKey
+	if s.MasterKeyFile != "" {
+		body, err := os.ReadFile(s.MasterKeyFile)
+		if err != nil {
+			return fmt.Errorf("read master_key_file: %w", err)
+		}
+		masterKey = strings.TrimSpace(string(body))
+	}
+	if masterKey == "" {
+		return fmt.Errorf("master_key or master_key_file is required to decrypt alias credentials")
+	}
+	decrypter, err := crypto.NewFromBase64(masterKey)
+	if err != nil {
+		return fmt.Errorf("master_key: %w", err)
+	}
+
 	var diskCache *cache.Cache
 	if s.CacheDir != "" {
 		c, err := cache.Open(cache.Options{
@@ -166,24 +197,36 @@ func (s *S3Static) Provision(ctx caddy.Context) error {
 	}
 
 	snapshots := snapshot.NewStore()
+	credClient := credential.NewClient(snapshots, decrypter)
+	credClient.ConnectTimeout = time.Duration(s.UpstreamConnectTimeout)
+	credClient.ReadTimeout = time.Duration(s.UpstreamReadTimeout)
+	credClient.Logger = logger
+
+	// The poller mirrors the snapshot plus the credential, password and
+	// share-link directories, so a restart serves traffic with no control-plane
+	// request at all.
 	poller := snapshot.NewPoller(snapshot.PollerConfig{
 		BaseURL:  s.ControlURL,
 		Token:    token,
 		Interval: time.Duration(s.PollInterval),
 		Store:    snapshots,
 		Logger:   logger,
+		CacheDir: s.SnapshotCacheDir,
 	})
 	pollCtx, cancel := context.WithCancel(ctx.Context)
 	s.cancel = cancel
-	go poller.Run(pollCtx)
+	// Load before serving: with the control plane down this falls back to the
+	// disk mirror, so a restart keeps serving instead of racing an empty store.
+	if _, err := poller.Bootstrap(pollCtx); err != nil {
+		if pollCtx.Err() == nil {
+			logger.Error("snapshot bootstrap failed", slog.String("error", err.Error()))
+		}
+	}
+	go poller.Loop(pollCtx)
 
 	manifests := manifest.NewReader()
 	manifests.MaxBytes = s.ManifestCacheMaxBytes
 	manifests.TTL = time.Duration(s.ManifestCacheTTL)
-
-	credClient := credential.NewClient(s.ControlURL, token)
-	credClient.ConnectTimeout = time.Duration(s.UpstreamConnectTimeout)
-	credClient.ReadTimeout = time.Duration(s.UpstreamReadTimeout)
 
 	s.handler = handler.New(handler.Options{
 		Snapshots:            snapshots,
@@ -285,6 +328,21 @@ func (s *S3Static) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			s.CacheDir = d.Val()
+		case "master_key":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			s.MasterKey = d.Val()
+		case "master_key_file":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			s.MasterKeyFile = d.Val()
+		case "snapshot_cache_dir":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			s.SnapshotCacheDir = d.Val()
 		case "cache_max_bytes":
 			if !d.NextArg() {
 				return d.ArgErr()

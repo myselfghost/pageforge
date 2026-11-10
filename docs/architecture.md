@@ -774,7 +774,7 @@ HasDir(dir):
 数据面启动时从配置读取 `reserved_prefix`（默认 `/__pageforge`），在路由表中单独注册该前缀的 handler。请求匹配保留前缀后，进入保留路由分支：
 
 - `/__pageforge/healthz`、`/__pageforge/readyz` —— 数据面本地健康检查（不依赖控制面）；
-- `/__pageforge/internal/v1/snapshot`、`/__pageforge/internal/v1/aliases/{id}/credentials`、`/__pageforge/internal/v1/auth-policies`、`/__pageforge/internal/v1/reload` —— 反向代理到控制面内部 API；转发时只去掉 `/__pageforge` 前缀，路径其余部分与控制面完全一致；
+- `/__pageforge/internal/v1/snapshot`、`/__pageforge/internal/v1/alias-credentials`、`/__pageforge/internal/v1/aliases/{id}/credentials`、`/__pageforge/internal/v1/auth-policies`、`/__pageforge/internal/v1/share-links`、`/__pageforge/internal/v1/share-links/{token}/views`、`/__pageforge/internal/v1/reload` —— 反向代理到控制面内部 API；转发时只去掉 `/__pageforge` 前缀，路径其余部分与控制面完全一致；
 - `/s/{token}/*` —— 分享链接 handler（已实现）；
 - `/v/{project_id}/{version_id}/*` —— 版本直链 handler（已实现）；
 
@@ -1026,27 +1026,56 @@ prefixes:   /api /assets /static /media /_next /_nuxt
 - `GET /internal/v1/snapshot` 返回 snapshot JSON + `ETag: generation`。
 - 数据节点每 2s 请求，带 `If-None-Match`。
 - 支持 gzip（`Accept-Encoding: gzip`）下发，`ETag` 仍为 generation；序列化后超过 32MiB 时控制面记录 warning（本期不做 snapshot 分片）。
-- 新 generation 必须严格大于当前 generation，否则拒绝。
-- 解析并校验后，先拉取 `/internal/v1/auth-policies` 获取密码哈希，再原子替换 snapshot 与哈希目录；任一步失败保留旧数据。
+- 新 generation 必须不旧于当前 generation：更旧直接拒绝；相同视为成功但不再替换路由表。
+- `304 Not Modified` 只表示路由没变：凭证、密码哈希、分享链接目录都没有 generation，仍会照常拉取并替换，保证换 key、改密码、分享链接计数变化在 2s 内生效。
+- 收到新 snapshot 后，先校验 generation（更旧直接拒绝，不触碰任何数据），再拉取 `/internal/v1/alias-credentials`、`/internal/v1/auth-policies`、`/internal/v1/share-links` 三份目录，最后原子替换 snapshot 与三个目录。
+- 凭证或密码目录拉取失败时本轮不推进快照（否则新 alias 会 502/503），保留旧 snapshot 与旧目录；分享链接目录失败只记 warning 并保留旧目录，因为它按路由可选启用。
 - 失败保留旧 snapshot。
+- 磁盘副本仅在显式配置 `snapshot_cache_dir` 时启用，与 `cache_dir` 无关；未配置则不写任何文件、启动时也不会加载副本。
+- 每次成功更新后把 snapshot、密码哈希目录、alias 凭证目录各写一份到 `snapshot_cache_dir`（`snapshot.json`、`auth-policies.json`、`aliases.json`，同目录 temp file + rename）；分享链接目录内容变化时（含计数）单独重写 `shares.json`。
+- 启动时先同步初始化再对外服务（避免监听后短暂空路由）：向控制面请求共 4 次（首次 + 3 次重试，每次上限 5s，间隔 500ms）；仍失败则加载磁盘副本，校验通过后按普通快照激活并继续服务；副本缺失或校验失败则不加载，保持 503 直到控制面恢复。
+- 降级启动时四份文件同时加载：alias 凭证、密码哈希、分享链接目录都来自磁盘副本，因此 control 停机期间对象存储回源、绑定 Basic Auth、分享链接鉴权全部可用，无需任何控制面请求。
+- 从磁盘副本启动后，控制面恢复时按 generation 正常推进：控制面 generation 大于副本则替换；等于副本时视为成功（路由不变，仅刷新三份目录并重写副本）；小于副本时按“generation 回退拒绝加载”处理，保持现有语义。
+- 磁盘副本是降级数据，不参与 `/readyz` 判定：healthz/readyz 始终返回 200，同现有语义。
 - 支持 `POST /internal/v1/reload` 强制刷新。
 
 ### 12.3 凭证
 
-`GET /internal/v1/aliases/{id}/credentials` 返回：
+`GET /internal/v1/alias-credentials` 一次性返回全部 alias 的凭证目录（数据面随快照轮询，不再逐请求回源）：
 
 ```json
 {
-  "access_key": "...",
-  "secret_key": "...",
-  "credential_version": 7
+  "aliases": {
+    "ali_xxx": { "access_key": "...", "secret_cipher": "<base64>", "credential_version": 7 }
+  }
 }
 ```
 
 - 需要内部 token 或 mTLS。
-- 数据面按 alias + credential_version 缓存。
-- snapshot 中的 `credential_version` 变化时重新拉取。
+- **响应与数据库存储完全一致**：`secret_cipher` 是 AES-256-GCM 密文，控制面不解密、不返回明文。
+- 数据面必须配置与控制面相同的 `master_key`（或 `master_key_file`），在内存中解密后再对 S3 签名；密钥不匹配时回源返回 502 并记录解密失败原因。
+- 数据面保存整份目录，按 alias + credential_version 复用对象存储连接；snapshot 中的 `credential_version` 高于目录版本（或目录缺失该 alias）时返回 502，等下一次轮询补齐。
+- 磁盘副本 `aliases.json` 同样只存密文，因此快照副本目录不含任何明文密钥。
+- 单独接口 `GET /internal/v1/aliases/{id}/credentials` 保留用于兼容旧调用，同样只回密文。
 - 该响应不得写日志。
+
+### 12.4 分享链接
+
+`GET /internal/v1/share-links` 一次性返回全部分享链接的鉴权材料（含 bcrypt 密码哈希）：
+
+```json
+{
+  "links": {
+    "shr_xxx": { "id": "shr_x", "project_id": "prj_x", "version_id": "", "password_hash": "$2a$...",
+                  "enabled": true, "expires_at": "2026-12-01T00:00:00Z", "max_views": 100, "views": 3 }
+  }
+}
+```
+
+- 数据面用本地目录完成 token、密码、过期与次数校验，control 停机也不影响分享链接。
+- 访问计数在数据面本地累加，并在 control 可达时通过 `POST /internal/v1/share-links/{token}/views`（body `{"count": N}`）回写；回写失败只保留本地计数，待下次成功后再补发。
+- 目录尚未加载（首次轮询前）时退回 `POST /internal/v1/share-links/{token}/authorize`，与旧行为一致。
+
 
 ## 13. 发布流水线
 
@@ -1215,8 +1244,10 @@ type AuthPolicy struct {
 - snapshot 只含 policy ID、realm、mode 和 `secret_version`。
 - Basic 用户哈希通过内部接口 `GET /internal/v1/auth-policies` 获取；数据面在 snapshot 刷新时一并拉取，快照更新成功才替换内存中的哈希目录。
 - 任一用户变更（新增、改密、删除）都递增 `secret_version`，确保 snapshot generation 变化并触发数据面重新拉取。
-- S3 凭证通过 `GET /internal/v1/aliases/{id}/credentials` 获取并缓存。
-- 内存缓存按 `secret_version` 失效；密码目录未加载或版本不一致时失败关闭（503）。
+- S3 凭证通过 `GET /internal/v1/alias-credentials` 整目录下发，数据面随快照轮询并缓存，逐请求不再回源 control。
+- 下发的 secret 是 AES-256-GCM 密文（与数据库一致），数据面用 `master_key` 在内存解密后签名；明文既不经过网络也不落盘。
+- 内存缓存按 `credential_version` 复用；目录未加载或版本落后于 snapshot 时返回 502，等下一次轮询补齐。
+- 密码目录未加载或版本不一致时失败关闭（503）。
 
 ## 16. HTTP 语义
 
@@ -1467,10 +1498,13 @@ DELETE /auth-policies/{id}/users/{username}
 
 ```text
 GET  /internal/v1/snapshot
+GET  /internal/v1/alias-credentials       # 全部 alias 的 AK/SK 目录，随快照轮询
 GET  /internal/v1/aliases/{id}/credentials
 GET  /internal/v1/auth-policies            # 所有策略的用户名→bcrypt 哈希，Cache-Control: no-store
+GET  /internal/v1/share-links              # 全部分享链接目录（含 bcrypt 哈希），支持离线鉴权
+POST /internal/v1/share-links/{token}/views       # 数据面回写访问计数（尽力而为）
+POST /internal/v1/share-links/{token}/authorize   # 分享链接鉴权（目录缺失时的回退路径）
 POST /internal/v1/reload
-POST /internal/v1/share-links/{token}/authorize   # 数据面分享链接鉴权（密码/过期/访问计数）
 ```
 
 鉴权：`X-Internal-Token` 或 mTLS。仅监听内网地址。

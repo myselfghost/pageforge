@@ -44,7 +44,10 @@ type ProjectView struct {
 	Status           string             `json:"status"`
 }
 
-// BindingView is a live binding visible to the data plane.
+// BindingView is a live binding visible to the data plane. A binding with
+// Enabled=false is published as well, so the data plane knows its prefix is
+// claimed: requests under it fall back to the next shorter enabled binding
+// instead of being served by a stale snapshot's route.
 type BindingView struct {
 	ID              string             `json:"id"`
 	Host            string             `json:"host"`
@@ -76,6 +79,43 @@ type AuthPolicySecrets struct {
 	Mode          string            `json:"mode"`
 	SecretVersion int64             `json:"secret_version"`
 	Users         map[string]string `json:"users"`
+}
+
+// CredentialDirectory carries every alias's S3 credentials fetched separately
+// from the snapshot (FR-08), so the data plane never has to call the control
+// plane per request. Keys stay outside the snapshot body.
+type CredentialDirectory struct {
+	Aliases map[string]AliasCredentials `json:"aliases"`
+}
+
+// AliasCredentials is one alias's S3 key material exactly as the control plane
+// stores it: the secret stays AES-256-GCM sealed and the data plane decrypts it
+// in memory with its own master key. Plaintext secrets therefore never travel
+// over this channel and never reach the disk mirror.
+type AliasCredentials struct {
+	AccessKey     string `json:"access_key"`
+	SecretCipher  []byte `json:"secret_cipher"`
+	CredentialVer int64  `json:"credential_version"`
+}
+
+// ShareDirectory carries every share link's authorization material fetched
+// separately from the snapshot, so the data plane can authorize offline.
+type ShareDirectory struct {
+	Links map[string]ShareLinkSecrets `json:"links"`
+}
+
+// ShareLinkSecrets is one share link's authorization material. ExpiresAt is nil
+// when the link never expires.
+type ShareLinkSecrets struct {
+	ID           string            `json:"id"`
+	ProjectID    string            `json:"project_id"`
+	VersionID    string            `json:"version_id"`
+	PasswordHash string            `json:"password_hash"`
+	Enabled      bool              `json:"enabled"`
+	ExpiresAt    *time.Time        `json:"expires_at,omitempty"`
+	MaxViews     int64             `json:"max_views"`
+	Views        int64             `json:"views"`
+	Cache        model.CachePolicy `json:"cache"`
 }
 
 // Validate rejects snapshots a data plane must not activate.

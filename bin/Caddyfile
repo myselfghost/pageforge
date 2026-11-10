@@ -19,7 +19,12 @@
 			roll_at 00:00
 			roll_local_time
 		}
-		format json
+		# 时间格式：本地时区的 RFC3339，纳秒精度，例如
+		# "time":"2026-11-09T08:46:15.6150527+08:00"
+		format json {
+			time_format 2006-01-02T15:04:05.999999999Z07:00
+			time_local
+		}
 	}
 }
 
@@ -38,17 +43,34 @@
 			roll_at 00:00
 			roll_local_time
 		}
-		format json
+		# 时间格式：本地时区的 RFC3339，纳秒精度，例如
+		# "time":"2026-11-09T08:46:15.6150527+08:00"
+		format json {
+			time_format 2006-01-02T15:04:05.999999999Z07:00
+			time_local
+		}
 	}
 
 	route {
 		s3static {
 			control_url http://127.0.0.1:8081
 			internal_token 8e0629dd617885e71690d9932a1a75b7f7e4d5eb8ba0dc23ff4489cfff0a4fdb
-			poll_interval 2s
+			# 与控制面共享的 AES-256 主密钥（base64），必须与 control.yaml 的
+			# encryption.master_key 完全一致。
+			# 控制面下发的 alias secret 是密文（与数据库存的完全一致），
+			# proxy 只在内存中解密，磁盘副本里也不存在明文 secret。
+			# 也可改用 master_key_file 从文件读取。
+			master_key ZFIFZSjwMFc0CzY75HIdHpKQ8TlYZRy+FxA652VZV+w=
+			poll_interval 5s
 			# 系统保留前缀，可自定义，建议 /__pageforge
 			reserved_prefix /__pageforge
 			cache_dir ./cache
+			# 快照磁盘副本目录：每次成功从 control 更新快照后，把
+			# snapshot.json / auth-policies.json / aliases.json / shares.json 写一份到此处。
+			# 启动时先尝试 control（首次 + 3 次重试），仍不可用则降级加载此副本。
+			# 只有显式配置本项才会落盘；不配置则该目录下不写任何文件，
+			# 重启时 control 不可用将无法服务（与 cache_dir 无关）。
+			snapshot_cache_dir ./cache/.snapshot
 			cache_max_bytes 10737418240
 			cache_ttl 24h
 			#cache_max_bytes 10240

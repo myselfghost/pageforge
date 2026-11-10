@@ -94,6 +94,102 @@ func TestMatchRemainderTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestDisabledBindingFallsBackToShorterPrefix(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("root", "example.com", "/", true),
+		binding("sub", "example.com", "/ai-feng", false),
+	}})
+
+	match, ok := table.Match("example.com", "ai-feng/")
+	if !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng/" {
+		t.Fatalf("disabled prefix must fall back to root: %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+	match, ok = table.Match("example.com", "ai-feng")
+	if !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng" {
+		t.Fatalf("disabled prefix without trailing slash: %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+	match, ok = table.Match("example.com", "ai-feng/index.html")
+	if !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng/index.html" {
+		t.Fatalf("disabled sub-path must fall back to root: %+v ok=%v", match, ok)
+	}
+	if match, ok := table.Match("example.com", "ai-fengx/"); !ok || match.Binding.ID != "root" || match.Remainder != "ai-fengx/" {
+		t.Fatalf("sibling prefix = %+v ok=%v", match, ok)
+	}
+}
+
+// 停用等价于注释掉 nginx 的 location：请求跳过它，按最长前缀落到其他启用 location。
+func TestDisabledBindingSkipsLikeCommentedNginxLocation(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("root", "example.com", "/", true),
+		binding("ai-feng", "example.com", "/ai-feng", false),
+		binding("ai", "example.com", "/ai", true),
+	}})
+
+	if match, ok := table.Match("example.com", "ai-feng/"); !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng/" {
+		t.Fatalf("/ai-feng must fall through to /: %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+	if match, ok := table.Match("example.com", "ai/"); !ok || match.Binding.ID != "ai" || match.Remainder != "" {
+		t.Fatalf("/ai must stay routable: %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+}
+
+func TestDisabledBindingFallsBackToRootWhenNoShorterPrefix(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("root", "example.com", "/", true),
+		binding("ai-feng", "example.com", "/ai-feng", false),
+	}})
+
+	if match, ok := table.Match("example.com", "ai-feng/"); !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng/" {
+		t.Fatalf("disabled /ai-feng must fall through to /: %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+}
+
+func TestDisabledPrefixWithoutShorterBindingIsNotFound(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("sub", "example.com", "/ai-feng", false),
+		binding("other", "example.com", "/other", true),
+	}})
+	if match, ok := table.Match("example.com", "ai-feng/"); ok {
+		t.Fatalf("disabled prefix must not match: %+v", match)
+	}
+	if match, ok := table.Match("example.com", "ai-feng-one/"); ok {
+		t.Fatalf("prefix must match whole segments only: %+v", match)
+	}
+	if match, ok := table.Match("example.com", "other/"); !ok || match.Binding.ID != "other" {
+		t.Fatalf("enabled sibling = %+v ok=%v", match, ok)
+	}
+}
+
+func TestDisabledRootBindingKeepsServingOtherPrefixes(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("root", "example.com", "/", true),
+		binding("sub", "example.com", "/ai-feng", false),
+	}})
+	if match, ok := table.Match("example.com", ""); !ok || match.Binding.ID != "root" || match.Remainder != "" {
+		t.Fatalf("host root = %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+	if match, ok := table.Match("example.com", "ai-pms/"); !ok || match.Binding.ID != "root" || match.Remainder != "ai-pms/" {
+		t.Fatalf("sibling mount = %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+	if match, ok := table.Match("example.com", "ai-feng"); !ok || match.Binding.ID != "root" || match.Remainder != "ai-feng" {
+		t.Fatalf("disabled prefix without slash = %q ok=%v rem=%q", match.Binding.ID, ok, match.Remainder)
+	}
+}
+
+func TestEnabledSiblingUnderDisabledPrefix(t *testing.T) {
+	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
+		binding("root", "example.com", "/", true),
+		binding("docs", "example.com", "/docs", false),
+		binding("api", "example.com", "/docs/api", true),
+	}})
+	if match, ok := table.Match("example.com", "docs/api/v1"); !ok || match.Binding.ID != "api" || match.Remainder != "v1" {
+		t.Fatalf("enabled nested binding must still match: %+v ok=%v", match, ok)
+	}
+	if match, ok := table.Match("example.com", "docs/guide"); !ok || match.Binding.ID != "root" || match.Remainder != "docs/guide" {
+		t.Fatalf("disabled parent must fall back to root: %+v ok=%v", match, ok)
+	}
+}
+
 func TestHostWildcardAndFallback(t *testing.T) {
 	table := router.Build(&snapshot.Snapshot{Bindings: []snapshot.BindingView{
 		binding("exact", "www.example.com", "/", true),

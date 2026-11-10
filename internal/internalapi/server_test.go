@@ -133,14 +133,22 @@ func TestCredentialsEndpoint(t *testing.T) {
 	}
 	var creds struct {
 		AccessKey     string `json:"access_key"`
-		SecretKey     string `json:"secret_key"`
+		SecretCipher  []byte `json:"secret_cipher"`
 		CredentialVer int64  `json:"credential_version"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&creds); err != nil {
 		t.Fatalf("decode credentials: %v", err)
 	}
-	if creds.AccessKey != "AKIASECRET" || creds.SecretKey != "top-secret-value" || creds.CredentialVer == 0 {
+	// 控制面只回传密文：明文 secret 绝不能出现在该响应里。
+	if creds.AccessKey != "AKIASECRET" || len(creds.SecretCipher) == 0 || creds.CredentialVer == 0 {
 		t.Fatalf("unexpected credentials: %+v", creds)
+	}
+	secret, err := testutil.NewCipher(t).DecryptString(creds.SecretCipher)
+	if err != nil {
+		t.Fatalf("decrypt mirrored secret: %v", err)
+	}
+	if secret != "top-secret-value" {
+		t.Fatalf("decrypted secret = %q", secret)
 	}
 
 	resp = get(t, srv.URL+"/internal/v1/aliases/missing/credentials", "internal-token", nil)

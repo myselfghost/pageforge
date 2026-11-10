@@ -57,8 +57,8 @@ type Options struct {
 	// ApplyResponseHeaders is the M4 hook for project/binding header rules.
 	ApplyResponseHeaders func(w http.ResponseWriter, project snapshot.ProjectView, binding snapshot.BindingView)
 
-	// ShareAuth authorizes share-link requests (FR-18). When nil and
-	// ControlURL is set, a control-plane client is used.
+	// ShareAuth authorizes share-link requests (FR-18). When nil, links are
+	// validated against the mirrored snapshot directory.
 	ShareAuth ShareAuthorizer
 }
 
@@ -106,8 +106,11 @@ func New(opts Options) *Handler {
 		authCache: newBasicAuthCache(),
 	}
 	h.proxy = buildProxy(opts.ControlURL, opts.InternalToken, opts.ReservedPrefix)
-	if h.shareAuth == nil && opts.ControlURL != "" {
-		h.shareAuth = newControlShareAuthorizer(opts.ControlURL, opts.InternalToken)
+	// Share links authorize locally from the mirrored directory so an offline
+	// data plane keeps serving; the control plane is only a fallback before the
+	// first poll and the view-count write-back target.
+	if h.shareAuth == nil && opts.Snapshots != nil {
+		h.shareAuth = newLocalShareAuthorizer(opts.Snapshots, opts.ControlURL, opts.InternalToken)
 	}
 	return h
 }

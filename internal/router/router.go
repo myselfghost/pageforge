@@ -10,24 +10,10 @@ import (
 
 // Table is an immutable routing table built from one snapshot.
 type Table struct {
-	exact         map[string]*hostNode
-	wildcards     []wildcardRoute
-	wildcardIndex map[string]int // suffix -> index in wildcards (dedup during Build only)
-	fallback      *hostNode
-}
-
-type wildcardRoute struct {
-	suffix string // includes the leading dot, e.g. ".example.com"
-	node   *hostNode
-}
-
-type hostNode struct {
-	root *pathNode
-}
-
-type pathNode struct {
-	children map[string]*pathNode
-	binding  *snapshot.BindingView
+	snap *snapshot.Snapshot
+	// ranked 按路径前缀长度降序保存启用绑定的下标。停用绑定不进入该列表，因此
+	// 最长前缀未命中或被停用时，会继续尝试更短的前缀（如 /ai 或 /）。
+	ranked []int
 }
 
 // Match is one successful route lookup.
@@ -36,125 +22,87 @@ type Match struct {
 	Remainder string // project-relative, no leading slash, trailing slash preserved
 }
 
-// Build compiles a routing table. Bindings with enabled=false are ignored.
-// Wildcard suffixes are sorted once at the end by descending length, so that
-// longer (more specific) wildcards are checked first by hostNode().
+// Build compiles a routing table. Bindings with enabled=false never match: the
+// lookup skips them and continues with the next shorter enabled prefix.
 func Build(snap *snapshot.Snapshot) *Table {
-	t := &Table{
-		exact:         map[string]*hostNode{},
-		wildcardIndex: map[string]int{},
-	}
+	t := &Table{snap: snap}
 	if snap == nil {
 		return t
 	}
 	for i := range snap.Bindings {
-		b := snap.Bindings[i]
-		if !b.Enabled {
-			continue
+		if snap.Bindings[i].Enabled {
+			t.ranked = append(t.ranked, i)
 		}
-		node := t.host(b.Host)
-		node.root.insert(b.PathPrefix, &b)
 	}
-	// 单次排序：把 host() 里每次 append 都 sort 的 O(N² log N) 降到 O(N log N)
-	sort.SliceStable(t.wildcards, func(i, j int) bool {
-		return len(t.wildcards[i].suffix) > len(t.wildcards[j].suffix)
+	prefixLen := func(i int) int { return len(snap.Bindings[i].PathPrefix) }
+	sort.SliceStable(t.ranked, func(a, b int) bool {
+		ia, ib := t.ranked[a], t.ranked[b]
+		if prefixLen(ia) != prefixLen(ib) {
+			return prefixLen(ia) > prefixLen(ib)
+		}
+		// 同长度前缀时优先更具体的 host（精确 > 通配 > "*"），通配中后缀更长者优先。
+		sa, sb := hostSpecificity(snap.Bindings[ia].Host), hostSpecificity(snap.Bindings[ib].Host)
+		if sa != sb {
+			return sa > sb
+		}
+		return len(snap.Bindings[ia].Host) > len(snap.Bindings[ib].Host)
 	})
 	return t
 }
 
-func (t *Table) host(host string) *hostNode {
-	if host == "*" {
-		if t.fallback == nil {
-			t.fallback = newHostNode()
-		}
-		return t.fallback
+// hostSpecificity ranks host patterns so exact hosts win over wildcards.
+func hostSpecificity(host string) int {
+	switch {
+	case host == "*":
+		return 0
+	case strings.HasPrefix(host, "*."):
+		return 1
+	default:
+		return 2
 	}
-	if strings.HasPrefix(host, "*.") {
-		suffix := host[1:]
-		if idx, ok := t.wildcardIndex[suffix]; ok {
-			return t.wildcards[idx].node
-		}
-		node := newHostNode()
-		t.wildcardIndex[suffix] = len(t.wildcards)
-		t.wildcards = append(t.wildcards, wildcardRoute{suffix: suffix, node: node})
-		return node
-	}
-	node, ok := t.exact[host]
-	if !ok {
-		node = newHostNode()
-		t.exact[host] = node
-	}
-	return node
-}
-
-func newHostNode() *hostNode {
-	return &hostNode{root: &pathNode{children: map[string]*pathNode{}}}
-}
-
-func (n *pathNode) insert(prefix string, binding *snapshot.BindingView) {
-	node := n
-	for _, segment := range segments(strings.TrimPrefix(prefix, "/")) {
-		child, ok := node.children[segment]
-		if !ok {
-			child = &pathNode{children: map[string]*pathNode{}}
-			node.children[segment] = child
-		}
-		node = child
-	}
-	node.binding = binding
 }
 
 // Match resolves host and a normalized path key (no leading slash, trailing
-// slash preserved) to the longest matching binding.
+// slash preserved) to the longest matching enabled binding. Disabled bindings
+// are absent from the table, so their prefixes fall through to the next shorter
+// enabled prefix instead of returning "not found".
 func (t *Table) Match(host, pathKey string) (Match, bool) {
-	node := t.hostNode(host)
-	if node == nil {
-		return Match{}, false
-	}
-
 	trailing := strings.HasSuffix(pathKey, "/")
-	segs := segments(strings.TrimSuffix(pathKey, "/"))
-
-	current := node.root
-	best := current.binding
-	depth := 0
-	for i, segment := range segs {
-		child, ok := current.children[segment]
-		if !ok {
-			break
+	for _, idx := range t.ranked {
+		candidate := t.snap.Bindings[idx]
+		if !hostMatches(candidate.Host, host) || !pathHasPrefix(pathKey, candidate.PathPrefix) {
+			continue
 		}
-		current = child
-		depth = i + 1
-		if current.binding != nil {
-			best = current.binding
+		remainder := strings.TrimPrefix(strings.TrimSuffix(pathKey, "/"), strings.Trim(candidate.PathPrefix, "/"))
+		remainder = strings.TrimPrefix(remainder, "/")
+		if trailing && remainder != "" && !strings.HasSuffix(remainder, "/") {
+			remainder += "/"
 		}
+		return Match{Binding: candidate, Remainder: remainder}, true
 	}
-	if best == nil {
-		return Match{}, false
-	}
-
-	remainder := strings.Join(segs[depth:], "/")
-	if trailing && remainder != "" {
-		remainder += "/"
-	}
-	return Match{Binding: *best, Remainder: remainder}, true
+	return Match{}, false
 }
 
-func (t *Table) hostNode(host string) *hostNode {
-	if node, ok := t.exact[host]; ok {
-		return node
+// hostMatches reports whether a binding host pattern matches the request host.
+func hostMatches(pattern, host string) bool {
+	switch {
+	case pattern == "*":
+		return true
+	case strings.HasPrefix(pattern, "*."):
+		suffix := pattern[1:]
+		return len(host) > len(suffix) && strings.HasSuffix(host, suffix)
+	default:
+		return pattern == host
 	}
-	for _, route := range t.wildcards {
-		if len(host) > len(route.suffix) && strings.HasSuffix(host, route.suffix) {
-			return route.node
-		}
-	}
-	return t.fallback
 }
 
-func segments(path string) []string {
-	if path == "" {
-		return nil
+// pathHasPrefix reports whether pathKey sits at or under prefix, comparing
+// whole segments so that /ai does not match /ai-feng.
+func pathHasPrefix(pathKey, prefix string) bool {
+	p := strings.Trim(prefix, "/")
+	if p == "" {
+		return true
 	}
-	return strings.Split(path, "/")
+	key := strings.TrimSuffix(pathKey, "/")
+	return key == p || strings.HasPrefix(key, p+"/")
 }

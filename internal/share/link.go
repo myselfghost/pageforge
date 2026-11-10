@@ -16,6 +16,7 @@ import (
 	"github.com/pageforge/pageforge/internal/httpx"
 	"github.com/pageforge/pageforge/internal/ids"
 	"github.com/pageforge/pageforge/internal/model"
+	"github.com/pageforge/pageforge/internal/snapshot"
 	"github.com/pageforge/pageforge/internal/store"
 )
 
@@ -331,6 +332,60 @@ func (r *Repo) Authorize(ctx context.Context, token, password string, countView 
 		return Link{}, err
 	}
 	return link, nil
+}
+
+// AddViews applies a data-plane view-count flush. It deliberately does not
+// re-check the token's validity: the data plane already authorized the request
+// offline, and dropping the increment here would silently under-count. It is a
+// no-op for unknown or deleted tokens.
+func (r *Repo) AddViews(ctx context.Context, token string, count int64) error {
+	if count <= 0 {
+		return nil
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return httpx.NotFound("SHARE_LINK_NOT_FOUND", "share link not found")
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE share_links SET views = views + ?, updated_at = ? WHERE token = ? AND deleted_at IS NULL`,
+		count, time.Now().UTC(), token)
+	if err != nil {
+		return fmt.Errorf("add share views: %w", err)
+	}
+	return nil
+}
+
+// Directory returns every live share link's authorization material for the
+// internal share directory endpoint. Password hashes are included so the data
+// plane can validate offline. The rows are ordered for a stable payload, and
+// the result must never be logged.
+func (r *Repo) Directory(ctx context.Context) (snapshot.ShareDirectory, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+linkColumns+` FROM share_links WHERE deleted_at IS NULL ORDER BY token ASC`)
+	if err != nil {
+		return snapshot.ShareDirectory{}, fmt.Errorf("query share links: %w", err)
+	}
+	defer rows.Close()
+
+	dir := snapshot.ShareDirectory{Links: map[string]snapshot.ShareLinkSecrets{}}
+	for rows.Next() {
+		link, err := scan(rows)
+		if err != nil {
+			return snapshot.ShareDirectory{}, fmt.Errorf("scan share link: %w", err)
+		}
+		dir.Links[link.Token] = snapshot.ShareLinkSecrets{
+			ID:           link.ID,
+			ProjectID:    link.ProjectID,
+			VersionID:    link.VersionID,
+			PasswordHash: link.passwordHash,
+			Enabled:      link.Enabled,
+			ExpiresAt:    link.ExpiresAt,
+			MaxViews:     link.MaxViews,
+			Views:        link.Views,
+			Cache:        link.Cache,
+		}
+	}
+	return dir, rows.Err()
 }
 
 func (r *Repo) checkProjectVersion(ctx context.Context, projectID, versionID string) error {
